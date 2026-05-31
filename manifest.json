@@ -1,0 +1,13 @@
+{
+    "display_name": "Prompt Notebooks",
+    "loading_order": 12,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "bla2967",
+    "version": "0.1.0",
+    "homePage": "",
+    "auto_update": false,
+    "generate_interceptor": "promptNotebooksInterceptor"
+}

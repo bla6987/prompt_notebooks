@@ -1,0 +1,10 @@
+# Local dev pointer (machine-specific path) — not for publishing
+agents.md
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+
+# Dependencies (none currently, but just in case)
+node_modules/
