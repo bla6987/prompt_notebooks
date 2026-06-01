@@ -39,7 +39,12 @@ SillyTavern. Open it from the **wand menu → Prompt Notebooks**, or run `/noteb
   Any field left blank **inherits** the notebook's default.
 - **⚙** on a notebook edits its name and the defaults its prompts inherit.
 - **Drag** a prompt to reorder it, or drop it onto another notebook's header to move it there.
-  Order is meaningful: prompts sharing the same depth/position are concatenated in list order.
+
+### How prompts combine in the prompt
+SillyTavern merges injections by level: prompts at the **same position, depth, and role** are
+concatenated (newline-separated) into a **single** block/message, in this list's order (drag to
+change it). Different roles at the same depth become separate messages (ordered System → User →
+Assistant); different depths inject at their own positions.
 - In the editor, **Duplicate** clones a prompt (and reopens on the copy); **Delete prompt** removes it (with confirm).
 
 ### Per-chat text override

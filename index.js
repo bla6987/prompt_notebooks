@@ -42,6 +42,7 @@
     let initialized = false;
     let $panel = null;
     let dragId = null;                         // prompt id currently being drag-reordered
+    let appliedKeys = new Set();               // extension_prompt keys we set last apply (for cleanup)
 
     const getCtx = () => globalThis.SillyTavern?.getContext?.();
     const uuid = () => (getCtx()?.uuidv4?.() ?? ('id-' + Math.abs(hashStr(String(performance.now()) + Object.keys({}).length)).toString(36)));
@@ -132,7 +133,9 @@
 
     // ─────────────────────────────────────────────────────────── injection apply
 
-    function promptKey(p) { return KEY_PREFIX + p.id; }
+    // Key encodes the prompt's list index (zero-padded) so the core's Object.keys().sort() in
+    // getExtensionPrompt merges same-level prompts in YOUR drag order, not by random uuid.
+    function promptKey(p, idx) { return KEY_PREFIX + String(idx).padStart(5, '0') + '_' + p.id; }
 
     function intervalFilter(interval) {
         const n = Number(interval) || 1;
@@ -144,31 +147,42 @@
         };
     }
 
-    /** Re-evaluate every prompt and push it (or clear it) into the core extension_prompts registry. */
+    /** Re-evaluate every prompt and push it into the core extension_prompts registry (in list order). */
     function applyInjections() {
         const ctx = getCtx();
         if (!ctx?.setExtensionPrompt) return;
         const s = getSettings();
         const sc = scopeContext();
-        for (const p of s.prompts) {
+        // Drop the keys we set last time — indices/text may have changed, so re-key cleanly.
+        for (const k of appliedKeys) { try { delete ctx.extensionPrompts[k]; } catch { /* noop */ } }
+        appliedKeys = new Set();
+        s.prompts.forEach((p, idx) => {
             const text = effText(p, sc);
             // macroOnly notebooks are delivered via {{notebook:Name}}, never auto-injected
             const on = !notebookOf(p).macroOnly && isVisible(p, sc) && isActive(p, sc) && String(text).length > 0;
+            if (!on) return;
+            const key = promptKey(p, idx);
             ctx.setExtensionPrompt(
-                promptKey(p),
-                on ? String(text) : '',
+                key,
+                String(text),
                 Number(eff(p, 'position')),
                 Number(eff(p, 'depth')),
                 !!eff(p, 'scan'),
                 Number(eff(p, 'role')),
-                on ? intervalFilter(eff(p, 'interval')) : null,
+                intervalFilter(eff(p, 'interval')),
             );
-        }
+            appliedKeys.add(key);
+        });
     }
 
     function clearPromptKey(id) {
-        const ctx = getCtx();
-        try { delete ctx.extensionPrompts[KEY_PREFIX + id]; } catch { /* noop */ }
+        const all = getCtx()?.extensionPrompts || {};
+        for (const k of Object.keys(all)) {
+            if (k.startsWith(KEY_PREFIX) && k.endsWith('_' + id)) {
+                try { delete all[k]; } catch { /* noop */ }
+                appliedKeys.delete(k);
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────────── prompt CRUD
@@ -470,15 +484,21 @@
     function onDrop(e) {
         if (!dragId) return;
         e.preventDefault();
+        const id = dragId;   // capture: onDragEnd nulls dragId before the deferred move runs
         const row = e.target.closest('.pnb-prompt');
         const head = e.target.closest('.pnb-nb-head');
-        if (row && row.dataset.id !== dragId) {
-            const after = e.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2;
-            movePrompt(dragId, row.dataset.id, after);
-        } else if (head) {
-            moveToNotebook(dragId, head.dataset.id);
-        }
         clearDragMarks();
+        // Defer the reorder + re-render: mutating the list during 'drop' destroys the drag
+        // source, so 'dragend' never fires and the browser stays stuck in drag mode (freeze).
+        // setTimeout(0) runs after both drop and dragend have completed.
+        if (row && row.dataset.id !== id) {
+            const after = e.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2;
+            const targetId = row.dataset.id;
+            setTimeout(() => movePrompt(id, targetId, after), 0);
+        } else if (head) {
+            const notebookId = head.dataset.id;
+            setTimeout(() => moveToNotebook(id, notebookId), 0);
+        }
     }
     function onDragEnd() {
         dragId = null;
