@@ -40,7 +40,10 @@
     });
 
     let initialized = false;
+    const hydratedNamespaces = new WeakSet();
+    let overrideRevision = 0;
     let $panel = null;
+    let editor = null;                       // selected prompt + the chat its controls belong to
     let dragId = null;                         // prompt id currently being drag-reordered
     let appliedKeys = new Set();               // extension_prompt keys we set last apply (for cleanup)
 
@@ -93,11 +96,46 @@
         const m = meta[NS];
         m.active ??= {};
         m.overrides ??= {};
+        m.overrideRevisions ??= {};
+        // Native metadata saves are debounced and can be cancelled by a fast chat switch.
+        // Recover only this chat's pending edits, then retire them once a reload confirms the revision.
+        // updateChatMetadata shallow-copies the outer object without loading from disk.
+        // Only a fresh namespace can confirm a persisted revision.
+        if (!hydratedNamespaces.has(m)) {
+            hydratedNamespaces.add(m);
+            const s = getSettings();
+            const key = overrideChatKey(ctx);
+            const pending = key ? s.pendingOverrides?.[key] : null;
+            if (pending) {
+                let recovered = false;
+                for (const [id, patch] of Object.entries(pending)) {
+                    const replacedChat = patch.integrity && meta.integrity && patch.integrity !== meta.integrity;
+                    if (replacedChat || !s.prompts.some(p => p.id === id) || (m.overrideRevisions[id] ?? 0) >= patch.revision) {
+                        delete pending[id];
+                    } else {
+                        if (patch.text) m.overrides[id] = { text: patch.text }; else delete m.overrides[id];
+                        m.overrideRevisions[id] = patch.revision;
+                        recovered = true;
+                    }
+                }
+                if (!Object.keys(pending).length) delete s.pendingOverrides[key];
+                saveSettings();
+                if (recovered) ctx.saveMetadataDebounced();
+            }
+        }
         if (!m.lineageId) {
             m.lineageId = uuid();
             ctx.saveMetadataDebounced();
         }
         return m;
+    }
+
+    function overrideChatKey(ctx = getCtx()) {
+        const chatId = ctx.getCurrentChatId?.();
+        if (!chatId) return null;
+        const owner = ctx.groupId != null ? ['group', ctx.groupId]
+            : ['character', ctx.characters?.[ctx.characterId]?.avatar ?? ctx.characterId];
+        return JSON.stringify([...owner, chatId]);
     }
 
     function scopeContext() {
@@ -195,8 +233,7 @@
     function deleteNotebook(id) {
         const s = getSettings();
         if (s.notebooks.length <= 1) { toast('Keep at least one notebook.', 'warning'); return; }
-        s.prompts.filter(p => p.notebookId === id).forEach(p => clearPromptKey(p.id));
-        s.prompts = s.prompts.filter(p => p.notebookId !== id);
+        for (const p of s.prompts.filter(p => p.notebookId === id)) deletePrompt(p.id);
         s.notebooks = s.notebooks.filter(n => n.id !== id);
         saveSettings(); refreshMacros(); applyInjections();
     }
@@ -224,7 +261,12 @@
         const s = getSettings();
         s.prompts = s.prompts.filter(p => p.id !== id);
         clearPromptKey(id);
-        const sc = scopeContext(); delete sc.active[id];
+        for (const [key, patches] of Object.entries(s.pendingOverrides || {})) {
+            delete patches[id];
+            if (!Object.keys(patches).length) delete s.pendingOverrides[key];
+        }
+        const sc = scopeContext(); delete sc.active[id]; delete sc.overrides[id];
+        if (sc.chatId) getCtx().saveMetadataDebounced();
         saveSettings(); applyInjections();
     }
 
@@ -242,6 +284,16 @@
         if (!m) { toast('Open a chat first.', 'info'); return; }
         m.overrides ??= {};
         if (text && text.length) m.overrides[promptId] = { text }; else delete m.overrides[promptId];
+        const key = overrideChatKey();
+        if (key) {
+            // Store a small recovery patch rather than saving snapshots of whole chats.
+            const revision = overrideRevision = Math.max(Date.now(), overrideRevision + 1, (m.overrideRevisions[promptId] ?? 0) + 1);
+            m.overrideRevisions[promptId] = revision;
+            const s = getSettings();
+            s.pendingOverrides ??= {};
+            (s.pendingOverrides[key] ??= {})[promptId] = { text: text || '', revision, integrity: getCtx().chatMetadata.integrity ?? null };
+            saveSettings();
+        }
         getCtx().saveMetadataDebounced();
         applyInjections();
     }
@@ -275,6 +327,7 @@
     // ─────────────────────────────────────────── notebook macros: {{notebook:Name}}
 
     const macroKeys = new Set();
+    let modernMacroRegistered = false;
 
     /** Joined text of the currently ON (in-scope + active) prompts in a notebook, with overrides. */
     function notebookText(name) {
@@ -293,6 +346,23 @@
     function refreshMacros() {
         const ctx = getCtx();
         if (!ctx?.registerMacro) return;
+        if (ctx.macros?.register && ctx.powerUserSettings?.experimental_macro_engine) {
+            for (const k of macroKeys) { ctx.unregisterMacro(k); }
+            macroKeys.clear();
+            if (!modernMacroRegistered) {
+                const registered = ctx.macros.register('notebook', {
+                    description: 'Joined active Prompt Notebooks text for the named notebook.',
+                    unnamedArgs: [{ name: 'name', type: 'string', description: 'Notebook name' }],
+                    handler: ({ unnamedArgs: [name] }) => notebookText(name),
+                });
+                modernMacroRegistered = !!registered;
+            }
+            return;
+        }
+        if (modernMacroRegistered) {
+            ctx.macros?.registry?.unregisterMacro('notebook');
+            modernMacroRegistered = false;
+        }
         const want = new Map();
         for (const nb of getSettings().notebooks) want.set('notebook:' + nb.name, nb.name);
         for (const k of [...macroKeys]) if (!want.has(k)) { try { ctx.unregisterMacro(k); } catch { /* noop */ } macroKeys.delete(k); }
@@ -379,7 +449,8 @@
             </div>
             <input class="pnb-search text_pole" placeholder="Search prompts…" />
             <div class="pnb-tags"></div>
-            <div class="pnb-list"></div>
+            <div class="pnb-editor-host"></div>
+            <details class="pnb-library" open><summary>Prompt library</summary><div class="pnb-list"></div></details>
             <div class="pnb-resize" data-resize></div>
             <input type="file" class="pnb-file" accept="application/json" hidden />
         `;
@@ -430,6 +501,8 @@
         if (cb) toggleActive(cb.dataset.id, cb.checked);
     }
     function onListClick(e) {
+        const nbEdit = e.target.closest('[data-nb-edit]');
+        if (nbEdit) { openNotebookEditor(getNotebook(nbEdit.dataset.nbEdit)); return; }
         const head = e.target.closest('.pnb-nb-head');
         if (head) {
             const nb = getNotebook(head.dataset.id);
@@ -440,8 +513,6 @@
             const p = getSettings().prompts.find(x => x.id === editBtn.dataset.edit);
             if (p) openEditor(structuredClone(p)); return;
         }
-        const nbEdit = e.target.closest('[data-nb-edit]');
-        if (nbEdit) { openNotebookEditor(getNotebook(nbEdit.dataset.nbEdit)); return; }
     }
     function onTagFilterClick(e) {
         const t = e.target.closest('[data-tag]')?.dataset.tag;
@@ -570,6 +641,7 @@
             html += `</div>`;
         }
         list.innerHTML = html;
+        syncEditor();
     }
 
     async function promptNotebookName() {
@@ -591,89 +663,181 @@
         return opts;
     }
 
-    async function openEditor(p) {
+    function editorContext() {
         const ctx = getCtx();
-        const nb = notebookOf(p);
-        const d = nb.defaults;
-        const isExisting = getSettings().prompts.some(x => x.id === p.id);
-        const chatId = ctx.getCurrentChatId?.();
-        const sc = scopeContext();
-        const ovText = sc.overrides?.[p.id]?.text ?? '';
-        const hasOv = !!sc.overrides?.[p.id];
-        const el = document.createElement('div');
-        el.className = 'pnb-editor';
-        el.innerHTML = `
-            ${field('Name', `<input class="text_pole" data-f="name" value="${esc(p.name)}" />`)}
-            ${field('Notebook', `<select data-f="notebookId">${getSettings().notebooks.map(n => `<option value="${n.id}" ${n.id === p.notebookId ? 'selected' : ''}>${esc(n.name)}</option>`).join('')}</select>`)}
-            ${field('Text', `<textarea class="text_pole" data-f="text" rows="6">${esc(p.text)}</textarea>`)}
-            ${field('Tags (comma-separated)', `<input class="text_pole" data-f="tags" value="${esc((p.tags || []).join(', '))}" />`)}
-            <div class="pnb-row">
-                ${field('Scope', `<select data-f="scope">${inheritSelect(SCOPE_LABELS, p.scope, SCOPE_LABELS[d.scope])}</select>`)}
-                ${field('Position', `<select data-f="position">${inheritSelect(POSITION_LABELS, p.position, POSITION_LABELS[d.position])}</select>`)}
-            </div>
-            <div class="pnb-row">
-                ${field('Depth', `<input type="number" min="0" class="text_pole" data-f="depth" value="${p.depth ?? ''}" placeholder="${d.depth}" />`)}
-                ${field('Role', `<select data-f="role">${inheritSelect(ROLE_LABELS, p.role, ROLE_LABELS[d.role])}</select>`)}
-                ${field('Frequency', `<input type="number" min="1" class="text_pole" data-f="interval" value="${p.interval ?? ''}" placeholder="${d.interval}" />`)}
-            </div>
-            ${field('Enabled by default in scoped chats', `<input type="checkbox" data-f="enabledByDefault" ${p.enabledByDefault !== false ? 'checked' : ''} />`)}
-            <div class="pnb-scopehint"></div>
-            ${(isExisting && chatId) ? `
-            <div class="pnb-defhdr">This chat only</div>
-            <label class="pnb-inline"><input type="checkbox" data-f="ovEnabled" ${hasOv ? 'checked' : ''} /> Use a different text in this chat</label>
-            ${field('Chat-specific text', `<textarea class="text_pole" data-f="ovText" rows="4" placeholder="(blank = use the prompt's text above)">${esc(ovText)}</textarea>`)}
-            ` : ''}
-            ${isExisting ? `<div class="pnb-actions"><span class="menu_button" data-f="duplicate">Duplicate</span><span class="menu_button" data-f="delete">Delete prompt</span></div>` : ''}
-        `;
-        const get = (f) => el.querySelector(`[data-f="${f}"]`);
-        const updateHint = () => {
-            const sv = get('scope').value;
-            const scope = sv === INHERIT ? d.scope : sv;
-            const chatId = ctx.getCurrentChatId?.();
-            el.querySelector('.pnb-scopehint').textContent =
-                scope === SCOPE.GLOBAL ? 'Applies to every chat.'
-                    : scope === SCOPE.THREAD ? `Binds to current chat: ${chatId || '(open a chat)'} — will NOT appear in branches.`
-                        : `Binds to current chat lineage — WILL appear in branches made from here.`;
-        };
-        get('scope').addEventListener('change', updateHint);
-        updateHint();
+        return { chatId: ctx.getCurrentChatId?.() ?? null, metadata: ctx.chatMetadata,
+            namespace: ctx.chatMetadata?.[NS], characterId: ctx.characterId, groupId: ctx.groupId };
+    }
 
-        let wantDelete = false, wantDuplicate = false;
-        const popup = new ctx.Popup(el, ctx.POPUP_TYPE.CONFIRM, '', { okButton: 'Save', cancelButton: 'Cancel', wide: true });
-        el.querySelector('[data-f="delete"]')?.addEventListener('click', () => { wantDelete = true; popup.completeCancelled(); });
-        el.querySelector('[data-f="duplicate"]')?.addEventListener('click', () => { wantDuplicate = true; popup.completeCancelled(); });
-        const result = await popup.show();
-        if (wantDelete) {
-            if (await ctx.Popup.show.confirm('Delete prompt', `Delete "${esc(p.name)}"?`)) { deletePrompt(p.id); render(); }
+    function sameEditorChat(binding) {
+        const now = editorContext();
+        const sameMetadata = binding.metadata === now.metadata
+            || (binding.namespace && binding.namespace === now.namespace);
+        return binding.chatId === now.chatId && sameMetadata
+            && binding.characterId === now.characterId && binding.groupId === now.groupId;
+    }
+
+    function openEditor(p) {
+        if (!getSettings().prompts.some(x => x.id === p.id)) {
+            if (!resolveScopeRef(p)) return;
+            upsertPrompt(p);
+        }
+        getSettings().panel.selectedPromptId = p.id;
+        editor = null;
+        togglePanel(true);
+        $panel.querySelector('[data-f="text"]')?.focus();
+    }
+
+    // The editor is separate from the library: list refreshes never replace its controls.
+    function syncEditor() {
+        const host = $panel.querySelector('.pnb-editor-host');
+        const s = getSettings();
+        const p = s.prompts.find(x => x.id === s.panel.selectedPromptId);
+        if (!p) {
+            editor = null;
+            host.innerHTML = '<div class="pnb-editor-empty">Select a prompt or press ＋ to write one.</div>';
             return;
         }
-        if (wantDuplicate) {
-            const src = getSettings().prompts.find(x => x.id === p.id) ?? p;
-            const copy = structuredClone(src);
-            copy.id = uuid(); copy.name = src.name + ' (copy)';
-            upsertPrompt(copy); render();
-            return openEditor(structuredClone(copy));
+        if (!editor || editor.id !== p.id || !sameEditorChat(editor)) {
+            const sc = scopeContext();
+            editor = { id: p.id, ...editorContext(), overrideEnabled: !!sc.overrides[p.id] };
+            buildEditor(host, p);
         }
-        if (result !== ctx.POPUP_RESULT.AFFIRMATIVE) return;
+        updateEditor(p);
+    }
 
-        const numOrNull = (f) => { const v = get(f).value.trim(); return v === '' ? null : Number(v); };
-        const selOrNull = (f) => { const v = get(f).value; return v === INHERIT ? null : (isNaN(Number(v)) ? v : Number(v)); };
+    function buildEditor(host, p) {
+        const d = notebookOf(p).defaults;
+        host.innerHTML = `<div class="pnb-editor pnb-inline-editor">
+            <div class="pnb-editor-heading"><strong data-editor-title></strong><span class="pnb-autosave">Saves as you type</span></div>
+            <label class="pnb-inline"><input type="checkbox" data-f="ovEnabled" /> Use a different text in this chat</label>
+            ${field('Prompt text', '<textarea aria-label="Prompt text" class="text_pole" data-f="text" rows="6"></textarea>')}
+            <div class="pnb-scopehint" data-text-hint></div>
+            <details class="pnb-prompt-settings"><summary>Prompt settings</summary>
+                ${field('Name', '<input aria-label="Prompt name" class="text_pole" data-f="name" />')}
+                ${field('Notebook', '<select aria-label="Notebook" data-f="notebookId"></select>')}
+                ${field('Tags (comma-separated)', '<input class="text_pole" data-f="tags" />')}
+                <div class="pnb-row">
+                    ${field('Scope', `<select data-f="scope">${inheritSelect(SCOPE_LABELS, p.scope, SCOPE_LABELS[d.scope])}</select>`)}
+                    ${field('Position', `<select data-f="position">${inheritSelect(POSITION_LABELS, p.position, POSITION_LABELS[d.position])}</select>`)}
+                </div>
+                <div class="pnb-row">
+                    ${field('Depth', '<input type="number" min="0" step="1" class="text_pole" data-f="depth" />')}
+                    ${field('Role', `<select data-f="role">${inheritSelect(ROLE_LABELS, p.role, ROLE_LABELS[d.role])}</select>`)}
+                    ${field('Frequency', '<input type="number" min="1" step="1" class="text_pole" data-f="interval" />')}
+                </div>
+                <label class="pnb-inline"><input type="checkbox" data-f="scan" /> <span data-scan-label>Allow World Info scanning</span></label>
+                <button type="button" class="menu_button" data-f="inheritScan">Use notebook scanning default</button>
+                <label class="pnb-inline"><input type="checkbox" data-f="enabledByDefault" /> Enabled by default in scoped chats</label>
+                <div class="pnb-scopehint" data-scope-hint></div>
+                <button type="button" class="menu_button" data-f="rebind">Bind scope to this chat</button>
+                <div class="pnb-actions"><button type="button" class="menu_button" data-f="duplicate">Duplicate</button><button type="button" class="menu_button" data-f="delete">Delete prompt</button></div>
+            </details>
+        </div>`;
+        const binding = editor;
+        host.addEventListener('input', onEditorInput);
+        host.addEventListener('change', onEditorInput);
+        host.addEventListener('focusout', onEditorBlur);
+        // Assigning onclick avoids accumulating handlers as different prompts are selected.
+        host.onclick = async (e) => {
+            const action = e.target.closest('button[data-f]')?.dataset.f;
+            if (!action || editor !== binding || !sameEditorChat(binding)) return;
+            const src = getSettings().prompts.find(x => x.id === binding.id);
+            if (!src) return;
+            if (action === 'duplicate') {
+                const copy = structuredClone(src);
+                copy.id = uuid(); copy.name += ' (copy)';
+                upsertPrompt(copy); openEditor(copy);
+            } else if (action === 'delete') {
+                if (await getCtx().Popup.show.confirm('Delete prompt', `Delete "${esc(src.name)}"?`)) {
+                    deletePrompt(src.id); render();
+                }
+            } else if (action === 'rebind') {
+                if (resolveScopeRef(src)) { upsertPrompt(src); render(); }
+            } else if (action === 'inheritScan') {
+                src.scan = null; upsertPrompt(src); render();
+            }
+        };
+    }
 
-        p.name = get('name').value.trim() || 'Untitled';
-        p.notebookId = get('notebookId').value;
-        p.text = get('text').value;
-        p.tags = get('tags').value.split(',').map(t => t.trim()).filter(Boolean);
-        p.scope = selOrNull('scope');          // string or null
-        p.position = selOrNull('position');
-        p.depth = numOrNull('depth');
-        p.role = selOrNull('role');
-        p.interval = numOrNull('interval');
-        p.enabledByDefault = get('enabledByDefault').checked;
+    function updateEditor(p) {
+        const el = $panel.querySelector('.pnb-editor-host');
+        const get = f => el.querySelector(`[data-f="${f}"]`);
+        const d = notebookOf(p).defaults;
+        const set = (f, value) => { const control = get(f); if (document.activeElement !== control) control.value = value; };
+        el.querySelector('[data-editor-title]').textContent = p.name || 'Untitled';
+        const notebook = get('notebookId');
+        const options = getSettings().notebooks.map(n => `<option value="${esc(n.id)}">${esc(n.name)}</option>`).join('');
+        if (notebook.innerHTML !== options) notebook.innerHTML = options;
+        set('notebookId', p.notebookId);
+        set('name', p.name);
+        set('tags', (p.tags || []).join(', '));
+        for (const f of ['scope', 'position', 'role']) {
+            const labels = { scope: SCOPE_LABELS, position: POSITION_LABELS, role: ROLE_LABELS }[f];
+            get(f).querySelector('option').textContent = `Inherit (${labels[d[f]]})`;
+            set(f, p[f] ?? INHERIT);
+        }
+        for (const f of ['depth', 'interval']) { set(f, p[f] ?? ''); get(f).placeholder = d[f]; }
+        get('enabledByDefault').checked = p.enabledByDefault !== false;
+        get('scan').checked = !!eff(p, 'scan');
+        el.querySelector('[data-scan-label]').textContent = `Allow World Info scanning${p.scan == null ? ' (inherited)' : ''}`;
+        const ov = get('ovEnabled');
+        ov.disabled = !editor.chatId;
+        ov.checked = editor.overrideEnabled;
+        set('text', editor.overrideEnabled ? (scopeContext().overrides[p.id]?.text ?? p.text ?? '') : (p.text ?? ''));
+        el.querySelector('[data-text-hint]').textContent = editor.overrideEnabled
+            ? 'Text for this chat only. Blank uses the shared text.' : 'Shared text — used wherever this prompt applies.';
+        el.querySelector('[data-text-hint]').title = editor.overrideEnabled ? editor.chatId : '';
+        el.querySelector('[data-scope-hint]').textContent = effScope(p) === SCOPE.GLOBAL ? 'Applies to every chat.'
+            : `Bound to ${effScope(p) === SCOPE.THREAD ? 'thread' : 'lineage'}: ${p.scopeRef || '(unbound)'}. Text edits keep this binding.`;
+        get('rebind').hidden = effScope(p) === SCOPE.GLOBAL;
+    }
 
-        if (!resolveScopeRef(p)) return;        // bind scopeRef (warns if no chat)
-        upsertPrompt(p);
-        const ovToggle = get('ovEnabled');
-        if (ovToggle) setOverride(p.id, ovToggle.checked ? (get('ovText')?.value ?? '') : '');
+    function onEditorBlur(e) {
+        if (!editor || !sameEditorChat(editor)) return;
+        // Flush the native debounce when leaving chat-specific text (e.g. to switch chats).
+        if (e.target.dataset.f === 'text' && editor.overrideEnabled) {
+            Promise.resolve(getCtx().saveMetadata?.()).catch(error => console.error('[Prompt Notebooks] metadata save', error));
+        }
+        if (e.target.dataset.f === 'name') {
+            const prompt = getSettings().prompts.find(x => x.id === editor.id);
+            if (prompt) { prompt.name = prompt.name.trim() || 'Untitled'; saveSettings(); render(); }
+        }
+    }
+
+    function onEditorInput(e) {
+        const f = e.target.dataset.f;
+        if (!f || !editor) return;
+        // A chat can change before CHAT_CHANGED is emitted. Reject stale controls even in that gap.
+        if (!sameEditorChat(editor)) { editor = null; render(); return; }
+        const p = getSettings().prompts.find(x => x.id === editor.id);
+        if (!p) return;
+        const control = e.target;
+        if (f === 'ovEnabled') {
+            editor.overrideEnabled = control.checked;
+            if (control.checked) setOverride(p.id, p.text || ''); else setOverride(p.id, '');
+            render(); return;
+        }
+        if (f === 'text' && editor.overrideEnabled) {
+            setOverride(p.id, control.value); render(); return;
+        }
+        const previousScope = effScope(p);
+        const next = { ...p };
+        if (f === 'text' || f === 'name') next[f] = control.value;
+        else if (f === 'tags') next.tags = control.value.split(',').map(t => t.trim()).filter(Boolean);
+        else if (f === 'scope' || f === 'position' || f === 'role') {
+            next[f] = control.value === INHERIT ? null : (f === 'scope' ? control.value : Number(control.value));
+        } else if (f === 'depth' || f === 'interval') {
+            if (!control.validity.valid) return;
+            next[f] = control.value === '' ? null : Number(control.value);
+        } else if (f === 'scan' || f === 'enabledByDefault') next[f] = control.checked;
+        else if (f === 'notebookId') next.notebookId = control.value;
+        else return;
+        if (effScope(next) !== previousScope && !resolveScopeRef(next)) {
+            control.value = p[f] ?? INHERIT;
+            updateEditor(p); return;
+        }
+        upsertPrompt(next);
         render();
     }
 

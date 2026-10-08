@@ -115,3 +115,22 @@
 .pnb-danger { margin-top: 8px; }
 .pnb-editor .pnb-actions { display: flex; gap: 8px; margin-top: 10px; }
 .pnb-editor .pnb-inline { display: flex; align-items: center; gap: 6px; font-size: 0.85em; margin-top: 4px; }
+
+/* Persistent prompt editor: list updates do not replace these controls. */
+.pnb-editor-host { flex: 0 1 auto; max-height: 68%; overflow-y: auto; min-height: 0; }
+.pnb-inline-editor { min-width: 0; padding: 8px; border-bottom: 1px solid var(--SmartThemeBorderColor, #444); }
+.pnb-editor-heading { display: flex; align-items: center; gap: 8px; }
+.pnb-editor-heading strong { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pnb-autosave { font-size: 0.75em; opacity: 0.65; white-space: nowrap; }
+.pnb-inline-editor textarea { min-height: 100px; margin: 0; }
+.pnb-inline-editor .pnb-inline input { width: auto; flex: 0 0 auto; }
+.pnb-prompt-settings > summary, .pnb-library > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+.pnb-prompt-settings[open] > summary { margin-bottom: 8px; }
+.pnb-prompt-settings .pnb-field { margin-bottom: 8px; }
+.pnb-inline-editor .pnb-actions { flex-wrap: wrap; }
+.pnb-inline-editor .pnb-row .pnb-field { min-width: 0; }
+.pnb-library { flex: 1 1 auto; min-height: 30px; overflow: hidden; padding: 0 6px; }
+.pnb-library[open] { display: flex; flex-direction: column; }
+.pnb-library .pnb-list { min-height: 0; }
+.pnb-editor-empty { padding: 8px; opacity: 0.65; }
+.pnb-inline-editor [hidden] { display: none !important; }
