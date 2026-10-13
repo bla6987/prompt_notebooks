@@ -46,6 +46,97 @@ test('editing is non-modal, autosaves, updates injections/macros, and preserves 
     t.dom.window.close();
 });
 
+test('typing shared text leaves library rows and unrelated injections intact', () => {
+    const t = setup();
+    t.input('text', 'other prompt');
+    const otherId = t.prompt().id;
+    t.click('[data-act="add-prompt"]');
+    const text = t.field('text'); text.focus();
+    const row = t.q(`.pnb-prompt[data-id="${t.prompt().id}"]`);
+    const otherKey = Object.keys(t.h.ctx.extensionPrompts).find(k => k.endsWith('_' + otherId));
+    const otherInjection = t.h.ctx.extensionPrompts[otherKey];
+    const observer = new t.w.MutationObserver(() => {});
+    observer.observe(t.q('#pnb-panel'), { childList: true, characterData: true, subtree: true });
+    for (let i = 1; i <= 20; i++) t.input('text', 'x'.repeat(i));
+    assert.equal(observer.takeRecords().length, 0);
+    assert.equal(t.q(`.pnb-prompt[data-id="${t.prompt().id}"]`), row);
+    assert.equal(t.h.ctx.extensionPrompts[otherKey], otherInjection);
+    assert.equal(Object.values(t.h.ctx.extensionPrompts)[1].text, 'x'.repeat(20));
+    assert.equal(t.h.macros.get('notebook:General')(), 'other prompt\n' + 'x'.repeat(20));
+    t.input('text', '');
+    assert.equal(Object.keys(t.h.ctx.extensionPrompts).length, 1);
+    assert.equal(t.h.ctx.extensionPrompts[otherKey], otherInjection);
+    observer.disconnect(); t.dom.window.close();
+});
+
+test('typing a chat override preserves the library and immediately updates recovery and injection', () => {
+    const t = setup(); t.input('text', 'shared'); t.input('ovEnabled', true);
+    const row = t.q('.pnb-prompt');
+    const observer = new t.w.MutationObserver(() => {});
+    observer.observe(t.q('#pnb-panel'), { childList: true, characterData: true, subtree: true });
+    for (let i = 1; i <= 20; i++) t.input('text', 'override ' + i);
+    assert.equal(observer.takeRecords().length, 0);
+    assert.equal(t.q('.pnb-prompt'), row);
+    assert.equal(t.prompt().text, 'shared');
+    assert.equal(Object.values(t.h.ctx.extensionPrompts)[0].text, 'override 20');
+    const patches = Object.values(t.settings.pendingOverrides)[0];
+    assert.equal(patches[t.prompt().id].text, 'override 20');
+    observer.disconnect(); t.dom.window.close();
+});
+
+test('text-dependent library refresh waits for a pause, preserves typing state, and cancels on chat change', () => {
+    const t = setup(); const timers = new Map(); let nextTimer = 0;
+    t.w.setTimeout = callback => { timers.set(++nextTimer, callback); return nextTimer; };
+    t.w.clearTimeout = id => timers.delete(id);
+    const search = t.q('.pnb-search'); search.value = 'needle';
+    search.dispatchEvent(new t.w.Event('input', { bubbles: true }));
+    assert.equal(t.q('.pnb-prompt'), null);
+    const text = t.field('text'); text.focus();
+    t.input('text', 'needle'); t.input('text', 'needle and more');
+    text.setSelectionRange(2, 4); text.scrollTop = 10;
+    assert.equal(t.q('.pnb-prompt'), null);
+    assert.equal(timers.size, 1);
+    const [id, refresh] = timers.entries().next().value; timers.delete(id); refresh();
+    assert.ok(t.q('.pnb-prompt'));
+    assert.equal(t.field('text'), text); assert.equal(t.w.document.activeElement, text);
+    assert.equal(text.selectionStart, 2); assert.equal(text.selectionEnd, 4); assert.equal(text.scrollTop, 10);
+    t.input('text', 'no match'); assert.equal(timers.size, 1);
+    t.h.switchChat('chat-b');
+    assert.equal(timers.size, 0); assert.equal(t.q('.pnb-prompt'), null);
+    t.dom.window.close();
+});
+
+test('override badge refresh is deferred while blank override text still falls back immediately', () => {
+    const t = setup(); t.input('text', 'shared'); t.input('ovEnabled', true);
+    const timers = new Map(); let nextTimer = 0;
+    t.w.setTimeout = callback => { timers.set(++nextTimer, callback); return nextTimer; };
+    t.w.clearTimeout = id => timers.delete(id);
+    t.input('text', '');
+    assert.equal(Object.values(t.h.ctx.extensionPrompts)[0].text, 'shared');
+    assert.ok(t.q('.pnb-chip.ov')); assert.equal(timers.size, 1);
+    const pending = [...timers.keys()][0];
+    t.input('text', 'new override');
+    assert.equal(timers.has(pending), false); assert.equal(timers.size, 1);
+    t.click('[data-act="close"]'); assert.equal(timers.size, 0);
+    t.click('#pnb-launch'); assert.ok(t.q('.pnb-chip.ov'));
+    assert.equal(t.field('text').value, 'new override');
+    t.dom.window.close();
+});
+
+test('change events following text input do not repeat autosave or injection updates', () => {
+    const t = setup();
+    for (const override of [false, true]) {
+        if (override) t.input('ovEnabled', true);
+        t.input('text', override ? 'chat text' : 'shared text');
+        const calls = { ...t.h.calls };
+        const injection = Object.values(t.h.ctx.extensionPrompts)[0];
+        t.field('text').dispatchEvent(new t.w.Event('change', { bubbles: true }));
+        assert.deepEqual({ ...t.h.calls }, calls);
+        assert.equal(Object.values(t.h.ctx.extensionPrompts)[0], injection);
+    }
+    t.dom.window.close();
+});
+
 test('per-chat overrides switch independently; stale events before CHAT_CHANGED cannot write into next chat', () => {
     const t = setup(); t.input('text', 'shared'); t.input('ovEnabled', true); t.input('text', 'only a');
     const id = t.prompt().id;

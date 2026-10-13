@@ -37,6 +37,7 @@ SillyTavern. Open it from the **wand menu → Prompt Notebooks**, or run `/noteb
 - Tick a prompt's checkbox to turn it on **for the current chat**. Out-of-scope prompts are dimmed.
 - Click a prompt name (or **✎**) to keep its editable text area open in the floating panel.
   Edit while using the rest of SillyTavern; text and settings **save as you type** (there is no Save/Cancel step).
+  Text updates its injection immediately; text-dependent search results and override badges refresh after a short typing pause.
   Closing the panel keeps your changes, and the selected prompt reopens with the panel, including after a reload.
 - Expand **Prompt settings** for name, notebook, tags, scope, position, depth, role, frequency,
   World Info scanning, and default activation. Blank numeric fields and **Inherit** selections use the notebook defaults.

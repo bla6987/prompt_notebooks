@@ -46,6 +46,7 @@
     let editor = null;                       // selected prompt + the chat its controls belong to
     let dragId = null;                         // prompt id currently being drag-reordered
     let appliedKeys = new Set();               // extension_prompt keys we set last apply (for cleanup)
+    let libraryRenderTimer = null;
 
     const getCtx = () => globalThis.SillyTavern?.getContext?.();
     const uuid = () => (getCtx()?.uuidv4?.() ?? ('id-' + Math.abs(hashStr(String(performance.now()) + Object.keys({}).length)).toString(36)));
@@ -194,23 +195,37 @@
         // Drop the keys we set last time — indices/text may have changed, so re-key cleanly.
         for (const k of appliedKeys) { try { delete ctx.extensionPrompts[k]; } catch { /* noop */ } }
         appliedKeys = new Set();
-        s.prompts.forEach((p, idx) => {
-            const text = effText(p, sc);
-            // macroOnly notebooks are delivered via {{notebook:Name}}, never auto-injected
-            const on = !notebookOf(p).macroOnly && isVisible(p, sc) && isActive(p, sc) && String(text).length > 0;
-            if (!on) return;
-            const key = promptKey(p, idx);
-            ctx.setExtensionPrompt(
-                key,
-                String(text),
-                Number(eff(p, 'position')),
-                Number(eff(p, 'depth')),
-                !!eff(p, 'scan'),
-                Number(eff(p, 'role')),
-                intervalFilter(eff(p, 'interval')),
-            );
-            appliedKeys.add(key);
-        });
+        s.prompts.forEach((p, idx) => applyPromptInjection(ctx, p, idx, sc));
+    }
+
+    function applyPromptInjection(ctx, p, idx, sc) {
+        const key = promptKey(p, idx);
+        const text = effText(p, sc);
+        // macroOnly notebooks are delivered via {{notebook:Name}}, never auto-injected
+        const on = !notebookOf(p).macroOnly && isVisible(p, sc) && isActive(p, sc) && String(text).length > 0;
+        if (!on) {
+            delete ctx.extensionPrompts[key];
+            appliedKeys.delete(key);
+            return;
+        }
+        ctx.setExtensionPrompt(
+            key,
+            String(text),
+            Number(eff(p, 'position')),
+            Number(eff(p, 'depth')),
+            !!eff(p, 'scan'),
+            Number(eff(p, 'role')),
+            intervalFilter(eff(p, 'interval')),
+        );
+        appliedKeys.add(key);
+    }
+
+    // Text edits cannot change list order or other prompts' injection settings.
+    function updatePromptInjection(p) {
+        const ctx = getCtx();
+        if (!ctx?.setExtensionPrompt) return;
+        const idx = getSettings().prompts.indexOf(p);
+        if (idx >= 0) applyPromptInjection(ctx, p, idx, scopeContext());
     }
 
     function clearPromptKey(id) {
@@ -279,7 +294,8 @@
     }
 
     /** Set (or clear, with empty text) a per-chat text override for a prompt. */
-    function setOverride(promptId, text) {
+    function setOverride(prompt, text) {
+        const promptId = prompt.id;
         const m = chatMeta();
         if (!m) { toast('Open a chat first.', 'info'); return; }
         m.overrides ??= {};
@@ -295,7 +311,7 @@
             saveSettings();
         }
         getCtx().saveMetadataDebounced();
-        applyInjections();
+        updatePromptInjection(prompt);
     }
 
     /** Reorder a prompt before/after a target (adopting the target's notebook). */
@@ -595,7 +611,17 @@
         return true;
     }
 
+    function scheduleLibraryRender() {
+        clearTimeout(libraryRenderTimer);
+        libraryRenderTimer = setTimeout(() => {
+            libraryRenderTimer = null;
+            render();
+        }, 250);
+    }
+
     function render() {
+        clearTimeout(libraryRenderTimer);
+        libraryRenderTimer = null;
         if (!$panel) return;
         const s = getSettings();
         const sc = scopeContext();
@@ -814,16 +840,35 @@
         if (!p) return;
         const control = e.target;
         if (f === 'ovEnabled') {
+            if (editor.overrideEnabled === control.checked) return;
             editor.overrideEnabled = control.checked;
-            if (control.checked) setOverride(p.id, p.text || ''); else setOverride(p.id, '');
+            if (control.checked) setOverride(p, p.text || ''); else setOverride(p, '');
             render(); return;
         }
-        if (f === 'text' && editor.overrideEnabled) {
-            setOverride(p.id, control.value); render(); return;
+        if (f === 'text') {
+            // Keep autosave, recovery and generation current without rebuilding the UI
+            // or every unrelated injection on each keystroke.
+            let needsLibraryRender = false;
+            if (editor.overrideEnabled) {
+                const previous = scopeContext().overrides[p.id]?.text ?? '';
+                if (previous === control.value) return;
+                setOverride(p, control.value);
+                needsLibraryRender = !!previous !== !!control.value; // override badge
+            } else {
+                if (p.text === control.value) return;
+                p.text = control.value;
+                saveSettings();
+                updatePromptInjection(p);
+                needsLibraryRender = !!getSettings().panel.search?.trim();
+            }
+            // Keep pushing a pending refresh back until typing pauses, including
+            // after the first character creates an override badge.
+            if (needsLibraryRender || libraryRenderTimer !== null) scheduleLibraryRender();
+            return;
         }
         const previousScope = effScope(p);
         const next = { ...p };
-        if (f === 'text' || f === 'name') next[f] = control.value;
+        if (f === 'name') next[f] = control.value;
         else if (f === 'tags') next.tags = control.value.split(',').map(t => t.trim()).filter(Boolean);
         else if (f === 'scope' || f === 'position' || f === 'role') {
             next[f] = control.value === INHERIT ? null : (f === 'scope' ? control.value : Number(control.value));
@@ -934,6 +979,10 @@
         s.panel.open = force === undefined ? !s.panel.open : !!force;
         $panel.style.display = s.panel.open ? 'flex' : 'none';
         if (s.panel.open) render();
+        else {
+            clearTimeout(libraryRenderTimer);
+            libraryRenderTimer = null;
+        }
         saveSettings();
     }
 
