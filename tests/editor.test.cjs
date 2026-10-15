@@ -401,3 +401,36 @@ test('imported libraries cannot inject HTML through ids or notebook defaults', a
     assert.match(t.settings.prompts.find(p => p.name === 'Evil').id, /^[\w-]+$/);
     assert.equal(t.w.document.querySelectorAll('img').length, 0);
 });
+
+
+test('notebook World Info scanning default can be edited without replacing the inline editor', async () => {
+    const t = setup(); t.input('text', 'Inherited scan');
+    const text = t.field('text'); text.focus();
+    t.h.ctx.Popup = class {
+        constructor(el) { this.el = el; }
+        async show() { this.el.querySelector('[data-f="scan"]').value = '1'; return 1; }
+    };
+    t.click('[data-nb-edit]'); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(t.settings.notebooks[0].defaults.scan, true);
+    assert.equal(Object.values(t.h.ctx.extensionPrompts)[0].scan, true);
+    assert.equal(t.field('text'), text);
+    t.dom.window.close();
+});
+
+test('resizing or reopening clamps the floating panel without rebuilding a focused editor', () => {
+    const t = setup(); const panel = t.q('#pnb-panel'); const text = t.field('text');
+    text.focus(); t.input('text', 'Keep this draft'); text.setSelectionRange(2, 6);
+    Object.defineProperty(t.w, 'innerWidth', { value: 320, configurable: true });
+    Object.defineProperty(t.w, 'innerHeight', { value: 500, configurable: true });
+    panel.getBoundingClientRect = () => ({ left: parseFloat(panel.style.left) || 0, top: parseFloat(panel.style.top) || 0, width: 300, height: 400 });
+    panel.style.left = '900px'; panel.style.top = '900px';
+    t.w.dispatchEvent(new t.w.Event('resize'));
+    assert.equal(panel.style.left, '14px'); assert.equal(panel.style.top, '94px');
+    assert.equal(t.field('text'), text); assert.equal(t.w.document.activeElement, text);
+    assert.equal(text.selectionStart, 2); assert.equal(text.selectionEnd, 6);
+    t.click('[data-act="close"]'); panel.style.left = '900px'; panel.style.top = '900px';
+    t.click('#pnb-launch');
+    assert.equal(panel.style.left, '14px'); assert.equal(panel.style.top, '94px');
+    assert.equal(t.field('text').value, 'Keep this draft');
+    t.dom.window.close();
+});

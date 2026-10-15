@@ -6,6 +6,8 @@
     flex-direction: column;
     min-width: 260px;
     min-height: 220px;
+    max-width: calc(100vw - 12px);
+    max-height: calc(100vh - 12px);
     background: var(--SmartThemeBlurTintColor, rgba(20, 20, 20, 0.95));
     backdrop-filter: blur(10px);
     border: 1px solid var(--SmartThemeBorderColor, #444);

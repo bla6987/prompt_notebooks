@@ -44,7 +44,8 @@ SillyTavern. Open it from the **wand menu → Prompt Notebooks**, or run `/noteb
   **Use notebook scanning default** restores inherited scanning. Collapse **Prompt library** for more writing space.
 - Changing the Scope or Notebook setting to a different effective scope binds to the current chat.
   Other edits preserve the existing binding; **Bind scope to this chat** explicitly rebinds it.
-- **⚙** on a notebook edits its name and the defaults its prompts inherit.
+- **⚙** on a notebook edits its name and the defaults its prompts inherit. World Info scanning is included in these defaults.
+- The floating panel stays within the viewport when you reopen it or resize the window.
 - **Drag** a prompt to reorder it, or drop it onto another notebook's header to move it there.
 
 ### How prompts combine in the prompt

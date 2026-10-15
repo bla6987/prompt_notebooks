@@ -480,6 +480,7 @@
             <input type="file" class="pnb-file" accept="application/json" hidden />
         `;
         document.body.appendChild($panel);
+        fitPanelToViewport();
 
         $panel.querySelector('.pnb-search').value = s.panel.search || '';
         wirePanelEvents();
@@ -518,6 +519,7 @@
         $panel.querySelector('.pnb-tags').addEventListener('click', onTagFilterClick);
 
         makeDraggable();
+        window.addEventListener('resize', fitPanelToViewport);
         makeResizable();
     }
 
@@ -912,6 +914,7 @@
                 ${field('Role', `<select data-f="role">${selectFor(ROLE_LABELS, d.role)}</select>`)}
                 ${field('Frequency', `<input type="number" min="1" class="text_pole" data-f="interval" value="${esc(d.interval)}" />`)}
             </div>
+            ${field('Allow World Info scan', `<select data-f="scan">${selectFor({ 0: 'No', 1: 'Yes' }, Number(d.scan))}</select>`)}
             <label class="pnb-inline"><input type="checkbox" data-f="macroOnly" ${nb.macroOnly ? 'checked' : ''} /> Macro-only — don't auto-inject; deliver via the macro below</label>
             <div class="pnb-scopehint">Embed in your Author's Note (or anywhere macros expand): <code>{{notebook:${esc(nb.name)}}}</code></div>
             <div class="pnb-actions"><span class="menu_button" data-f="delete">Delete notebook</span></div>
@@ -935,12 +938,19 @@
             depth: Number(get('depth').value),
             role: Number(get('role').value),
             interval: Number(get('interval').value),
-            scan: d.scan ?? false,
+            scan: get('scan').value === '1',
         };
         saveSettings(); refreshMacros(); applyInjections(); render();
     }
 
     // ─────────────────────────────────────────────────────────── drag & resize
+
+    function fitPanelToViewport() {
+        if (!$panel || $panel.style.display === 'none') return;
+        const r = $panel.getBoundingClientRect();
+        $panel.style.left = Math.max(0, Math.min(r.left, window.innerWidth - r.width - 6)) + 'px';
+        $panel.style.top = Math.max(0, Math.min(r.top, window.innerHeight - r.height - 6)) + 'px';
+    }
 
     function makeDraggable() {
         const header = $panel.querySelector('[data-drag]');
@@ -956,6 +966,7 @@
             const x = Math.max(0, ox + e.clientX - sx);
             const y = Math.max(0, oy + e.clientY - sy);
             $panel.style.left = x + 'px'; $panel.style.top = y + 'px';
+            fitPanelToViewport();
         });
         header.addEventListener('pointerup', (e) => {
             if (!dragging) return; dragging = false;
@@ -975,6 +986,7 @@
             if (!sizing) return;
             $panel.style.width = Math.max(260, ow + e.clientX - sx) + 'px';
             $panel.style.height = Math.max(220, oh + e.clientY - sy) + 'px';
+            fitPanelToViewport();
         });
         grip.addEventListener('pointerup', (e) => {
             if (!sizing) return; sizing = false; grip.releasePointerCapture(e.pointerId);
@@ -987,7 +999,7 @@
         if (!$panel) buildPanel();
         s.panel.open = force === undefined ? !s.panel.open : !!force;
         $panel.style.display = s.panel.open ? 'flex' : 'none';
-        if (s.panel.open) render();
+        if (s.panel.open) { fitPanelToViewport(); render(); }
         else {
             clearTimeout(libraryRenderTimer);
             libraryRenderTimer = null;

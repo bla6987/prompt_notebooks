@@ -1,0 +1,65 @@
+
+> test
+> node --test tests/*.test.cjs
+
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+✔ editing is non-modal, autosaves, updates injections/macros, and preserves focus/selection/scroll (56.098667ms)
+✔ typing shared text leaves library rows and unrelated injections intact (18.32525ms)
+✔ typing a chat override preserves the library and immediately updates recovery and injection (13.580209ms)
+✔ text-dependent library refresh waits for a pause, preserves typing state, and cancels on chat change (16.438333ms)
+✔ override badge refresh is deferred while blank override text still falls back immediately (21.723417ms)
+✔ change events following text input do not repeat autosave or injection updates (12.517916ms)
+✔ per-chat overrides switch independently; stale events before CHAT_CHANGED cannot write into next chat (23.601959ms)
+✔ metadata replacement and identical chat ids across characters reject stale override events (17.903666ms)
+✔ scope stays bound during ordinary edits and binds only when changed or explicitly rebound (21.852541ms)
+✔ settings apply immediately, honor inheritance, reject invalid numbers, and leave details expanded (23.262208ms)
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+✔ duplicate uses latest shared changes, delete closes selection, and notebook gear opens settings (17.145ms)
+✔ moving notebooks updates inherited settings without losing text focus or scope binding (15.52675ms)
+✔ empty override falls back to shared text, disabling default activation removes injection (10.362542ms)
+[Prompt Notebooks] initialized
+✔ drag order controls injection order, and dropping into a notebook preserves the open editor (24.442417ms)
+[Prompt Notebooks] initialized
+✔ import/export preserves settings and macros while leaving the selected text control intact (29.487834ms)
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+✔ new macro engine registers notebook with an argument and expands current toggles/overrides (11.071791ms)
+✔ leaving override text flushes metadata for its chat and stale blur cannot flush a different chat (9.706708ms)
+✔ pending override recovery survives cancelled native saves and restores only the owning chat (21.687084ms)
+✔ reloading extension settings recovers the last chat edit before native metadata reached disk (17.724625ms)
+✔ recovery keys distinguish characters and groups even when chat filenames are identical (17.089084ms)
+✔ native shallow metadata updates do not retire recovery before a disk reload (12.6905ms)
+[Prompt Notebooks] initialized
+[Prompt Notebooks] initialized
+✔ deleting a notebook also removes its pending chat recovery records (13.262791ms)
+✔ a replacement chat with the same filename cannot inherit a deleted chat recovery patch (10.126041ms)
+[Prompt Notebooks] initialized
+✔ imported libraries cannot inject HTML through ids or notebook defaults (57.592084ms)
+[Prompt Notebooks] initialized
+✔ notebook World Info scanning default can be edited without replacing the inline editor (9.268917ms)
+✔ resizing or reopening clamps the floating panel without rebuilding a focused editor (8.073959ms)
+ℹ tests 26
+ℹ suites 0
+ℹ pass 26
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 854.137916

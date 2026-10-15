@@ -1,0 +1,19 @@
+{
+  "initial": {
+    "bottom": 542,
+    "left": 4,
+    "right": 314,
+    "top": 80,
+    "viewportHeight": 600,
+    "viewportWidth": 320
+  },
+  "reopened": {
+    "bottom": 494,
+    "left": 4,
+    "right": 294,
+    "text": "Synthetic saved editor text",
+    "top": 32,
+    "viewportHeight": 500,
+    "viewportWidth": 300
+  }
+}
