@@ -380,3 +380,24 @@ test('a replacement chat with the same filename cannot inherit a deleted chat re
     assert.equal(Object.values(t.h.ctx.extensionPrompts)[0].text, 'shared');
     t.dom.window.close();
 });
+
+test('imported libraries cannot inject HTML through ids or notebook defaults', async () => {
+    const t = setup();
+    const payload = '"><img src=x onerror=alert(1)>';
+    const library = {
+        notebooks: [{ id: 'nb' + payload, name: 'Imported', defaults: { depth: payload, interval: payload } }],
+        prompts: [{ id: 'p' + payload, name: 'Evil', text: 'x', notebookId: 'nb' + payload }],
+    };
+    const fileInput = t.q('.pnb-file');
+    Object.defineProperty(fileInput, 'files', { value: [new t.w.File([JSON.stringify(library)], 'library.json')] });
+    fileInput.dispatchEvent(new t.w.Event('change'));
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const notebook = t.settings.notebooks.find(nb => nb.name === 'Imported');
+    assert.ok(notebook, 'library was imported');
+    assert.match(notebook.id, /^[\w-]+$/);
+    assert.equal(notebook.defaults.depth, 4);
+    assert.equal(notebook.defaults.interval, 1);
+    assert.match(t.settings.prompts.find(p => p.name === 'Evil').id, /^[\w-]+$/);
+    assert.equal(t.w.document.querySelectorAll('img').length, 0);
+});

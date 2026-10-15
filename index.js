@@ -414,6 +414,10 @@
         a.click();
         URL.revokeObjectURL(a.href);
     }
+    // Imported IDs end up in HTML attributes and selectors; accept only the
+    // plain identifiers this extension generates.
+    const isImportId = (id) => typeof id === 'string' && /^[\w-]{1,64}$/.test(id);
+
     function importLibrary(file) {
         const reader = new FileReader();
         reader.onload = () => {
@@ -422,13 +426,18 @@
                 const s = getSettings();
                 if (Array.isArray(data.notebooks)) {
                     for (const nb of data.notebooks) {
-                        nb.id ??= uuid(); nb.defaults = Object.assign(NOTEBOOK_DEFAULTS(), nb.defaults || {});
+                        if (!isImportId(nb?.id)) nb.id = uuid();
+                        nb.defaults = Object.assign(NOTEBOOK_DEFAULTS(), nb.defaults || {});
+                        for (const key of ['depth', 'interval']) {
+                            const value = Number(nb.defaults[key]);
+                            nb.defaults[key] = Number.isFinite(value) ? value : NOTEBOOK_DEFAULTS()[key];
+                        }
                         if (!s.notebooks.find(n => n.id === nb.id)) s.notebooks.push(nb);
                     }
                 }
                 if (Array.isArray(data.prompts)) {
                     for (const p of data.prompts) {
-                        p.id ??= uuid();
+                        if (!isImportId(p?.id)) p.id = uuid();
                         if (!s.notebooks.find(n => n.id === p.notebookId)) p.notebookId = s.notebooks[0].id;
                         if (!s.prompts.find(x => x.id === p.id)) s.prompts.push(p);
                     }
@@ -637,11 +646,11 @@
         for (const nb of s.notebooks) {
             const prompts = s.prompts.filter(p => p.notebookId === nb.id && matchesFilter(p, s, sc));
             html += `<div class="pnb-nb">
-                <div class="pnb-nb-head" data-id="${nb.id}">
+                <div class="pnb-nb-head" data-id="${esc(nb.id)}">
                     <span class="pnb-caret">${nb.collapsed ? '▸' : '▾'}</span>
                     <span class="pnb-nb-name">${esc(nb.name)}${nb.macroOnly ? ' <span class="pnb-chip" title="Macro-only — delivered via the {{notebook:Name}} macro">macro</span>' : ''}</span>
                     <span class="pnb-nb-count">${prompts.length}</span>
-                    <span class="pnb-btn small" data-nb-edit="${nb.id}" title="Notebook settings">⚙</span>
+                    <span class="pnb-btn small" data-nb-edit="${esc(nb.id)}" title="Notebook settings">⚙</span>
                 </div>`;
             if (!nb.collapsed) {
                 if (!prompts.length) html += `<div class="pnb-empty">No prompts</div>`;
@@ -650,17 +659,17 @@
                     const on = visible && isActive(p, sc);
                     const scope = effScope(p);
                     const hasOv = !!sc.overrides?.[p.id];
-                    html += `<div class="pnb-prompt ${visible ? '' : 'out-of-scope'}" draggable="true" data-id="${p.id}" title="${visible ? 'Drag to reorder' : 'Not in scope for this chat'}">
+                    html += `<div class="pnb-prompt ${visible ? '' : 'out-of-scope'}" draggable="true" data-id="${esc(p.id)}" title="${visible ? 'Drag to reorder' : 'Not in scope for this chat'}">
                         <label class="pnb-check">
-                            <input type="checkbox" class="pnb-toggle" data-id="${p.id}" ${on ? 'checked' : ''} ${visible ? '' : 'disabled'} />
+                            <input type="checkbox" class="pnb-toggle" data-id="${esc(p.id)}" ${on ? 'checked' : ''} ${visible ? '' : 'disabled'} />
                         </label>
-                        <span class="pnb-pname" data-edit="${p.id}">${esc(p.name)}${hasOv ? ' <span class="pnb-chip ov" title="Custom text in this chat">✎ chat</span>' : ''}</span>
+                        <span class="pnb-pname" data-edit="${esc(p.id)}">${esc(p.name)}${hasOv ? ' <span class="pnb-chip ov" title="Custom text in this chat">✎ chat</span>' : ''}</span>
                         <span class="pnb-chips">
                             <span class="pnb-chip" title="Scope">${SCOPE_ICON[scope]} ${esc(SCOPE_LABELS[scope])}</span>
                             <span class="pnb-chip">d${esc(eff(p, 'depth'))}</span>
                             <span class="pnb-chip">${esc(ROLE_LABELS[eff(p, 'role')])}</span>
                         </span>
-                        <span class="pnb-btn small" data-edit="${p.id}" title="Edit">✎</span>
+                        <span class="pnb-btn small" data-edit="${esc(p.id)}" title="Edit">✎</span>
                     </div>`;
                 }
             }
@@ -899,9 +908,9 @@
                 ${field('Position', `<select data-f="position">${selectFor(POSITION_LABELS, d.position)}</select>`)}
             </div>
             <div class="pnb-row">
-                ${field('Depth', `<input type="number" min="0" class="text_pole" data-f="depth" value="${d.depth}" />`)}
+                ${field('Depth', `<input type="number" min="0" class="text_pole" data-f="depth" value="${esc(d.depth)}" />`)}
                 ${field('Role', `<select data-f="role">${selectFor(ROLE_LABELS, d.role)}</select>`)}
-                ${field('Frequency', `<input type="number" min="1" class="text_pole" data-f="interval" value="${d.interval}" />`)}
+                ${field('Frequency', `<input type="number" min="1" class="text_pole" data-f="interval" value="${esc(d.interval)}" />`)}
             </div>
             <label class="pnb-inline"><input type="checkbox" data-f="macroOnly" ${nb.macroOnly ? 'checked' : ''} /> Macro-only — don't auto-inject; deliver via the macro below</label>
             <div class="pnb-scopehint">Embed in your Author's Note (or anywhere macros expand): <code>{{notebook:${esc(nb.name)}}}</code></div>
