@@ -11,8 +11,9 @@ function deferred() {
     return { promise, resolve, reject };
 }
 
-function rig({ identity = 'account-a' } = {}) {
+function rig({ identity = 'account-a', storage = true } = {}) {
     const timers = new Set();
+    let identityFetches = 0;
     let current = 'chat-a';
     const chats = { 'chat-a': {}, 'chat-b': {} };
     const settings = { notebooks: [{ id: 'nb', name: 'Book' }], prompts: [{ id: 'p', notebookId: 'nb', name: 'Prompt', text: 'shared' }], panel: {} };
@@ -22,8 +23,8 @@ function rig({ identity = 'account-a' } = {}) {
     };
     const sandbox = {
         SillyTavern: { getContext: () => ctx }, console: { log() {}, warn() {}, error() {} }, performance, AbortController,
-        indexedDB: {}, IDBKeyRange: { only: value => value },
-        fetch: async () => ({ ok: !!identity, json: async () => ({ handle: identity, avatar: 'unused' }) }),
+        indexedDB: storage ? {} : undefined, IDBKeyRange: { only: value => value },
+        fetch: async () => { identityFetches++; return { ok: !!identity, json: async () => ({ handle: identity, avatar: 'unused' }) }; },
         setTimeout(fn, ms) { const id = setTimeout(() => { timers.delete(id); fn(); }, ms); timers.add(id); return id; },
         clearTimeout(id) { timers.delete(id); clearTimeout(id); },
     };
@@ -34,13 +35,13 @@ function rig({ identity = 'account-a' } = {}) {
     const records = new Map();
     const reads = [];
     let activeWrites = 0, peakWrites = 0;
-    api.recoveryJournal.putLatest = async (account, chatKey, promptId, patch) => {
+    if (api.recoveryJournal) api.recoveryJournal.putLatest = async (account, chatKey, promptId, patch) => {
         activeWrites++; peakWrites = Math.max(peakWrites, activeWrites);
         const key = JSON.stringify([account, chatKey, promptId]);
         if (!records.has(key) || records.get(key).revision < patch.revision) records.set(key, { account, chatKey, promptId, ...patch });
         await Promise.resolve(); activeWrites--;
     };
-    api.recoveryJournal.visitChat = async (account, chatKey, visit) => {
+    if (api.recoveryJournal) api.recoveryJournal.visitChat = async (account, chatKey, visit) => {
         for (const [key, value] of records) {
             if (value.account !== account || value.chatKey !== chatKey) continue;
             reads.push(value);
@@ -57,6 +58,7 @@ function rig({ identity = 'account-a' } = {}) {
     };
     const key = (chat = current) => JSON.stringify(['character', 0, chat]);
     return { api, ctx, settings, records, reads, key, switchChat, peakWrites: () => peakWrites,
+        identityFetches: () => identityFetches, setIdentity(value) { identity = value; },
         close() { for (const timer of timers) clearTimeout(timer); } };
 }
 
@@ -95,6 +97,44 @@ test('failed storage and unavailable identity preserve every unconfirmed fallbac
             assert.equal(r.settings.pendingOverrides[r.key()].p.text, 'do not lose this edit');
         } finally { r.close(); }
     }
+});
+
+test('missing identity or IndexedDB blocks known disk-only recovery but preserves normal and settings fallback paths', async () => {
+    for (const options of [{ identity: null }, { storage: false }]) {
+        const r = rig(options);
+        try {
+            await r.api.recoverCurrentJournal();
+            r.settings.recoveryJournalRevisions = { [r.key()]: { p: 100 } };
+            await assert.rejects(r.api.recoverCurrentJournal(), /unavailable/);
+            assert.equal(r.ctx.chatMetadata.promptNotebooks.overrides.p, undefined);
+            assert.equal(r.reads.length, 0);
+
+            // A newer settings fallback is sufficient even without the optional journal.
+            r.settings.pendingOverrides = { [r.key()]: { p: { text: 'settings recovery', revision: 101 } } };
+            r.switchChat('chat-a', {});
+            await r.api.recoverCurrentJournal();
+            assert.equal(r.ctx.chatMetadata.promptNotebooks.overrides.p.text, 'settings recovery');
+            assert.equal(r.settings.pendingOverrides[r.key()].p.text, 'settings recovery');
+        } finally { r.close(); }
+    }
+});
+
+test('failed account lookup retries on the next recovery attempt and caches a verified identity', async () => {
+    const r = rig({ identity: null });
+    try {
+        r.settings.recoveryJournalRevisions = { [r.key()]: { p: 100 } };
+        r.records.set('durable', { account: 'account-a', chatKey: r.key(), promptId: 'p', text: 'disk-only edit', revision: 100 });
+        await assert.rejects(r.api.recoverCurrentJournal(), /Account identity/);
+        assert.equal(r.identityFetches(), 1);
+        r.setIdentity('account-a');
+        await r.api.recoverCurrentJournal();
+        assert.equal(r.identityFetches(), 2);
+        assert.equal(r.ctx.chatMetadata.promptNotebooks.overrides.p.text, 'disk-only edit');
+        assert.equal(r.records.size, 1, 'recovery is not native-save confirmation');
+        r.switchChat('chat-b', {});
+        await r.api.recoverCurrentJournal();
+        assert.equal(r.identityFetches(), 2, 'the verified account remains cached');
+    } finally { r.close(); }
 });
 
 test('archive writes release text; recovery reads only the owning account and current chat', async () => {

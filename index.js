@@ -252,9 +252,19 @@
                 return typeof user?.handle === 'string' && user.handle ? user.handle : null;
             } catch { return null; }
             finally { clearTimeout(timer); }
-        })();
+        })().then(account => {
+            // Coalesce an in-flight lookup and cache verified identities, but allow a
+            // later recovery attempt to retry a temporary authentication/network failure.
+            if (!account && accountRequests.get(settings) === promise) accountRequests.delete(settings);
+            return account;
+        });
         accountRequests.set(settings, promise);
         return promise;
+    }
+
+    function needsJournalRecovery(settings, chatKey, metadata) {
+        const revisions = settings.recoveryJournalRevisions?.[chatKey] || {};
+        return Object.entries(revisions).some(([id, revision]) => (metadata.overrideRevisions[id] ?? 0) < revision);
     }
 
     function applyRecoveryPatch(m, id, patch) {
@@ -321,8 +331,11 @@
         const ctx = getCtx();
         const chatKey = overrideChatKey(ctx);
         const m = chatKey ? chatMeta() : null;
-        if (!m || !recoveryJournal) return Promise.resolve();
+        if (!m) return Promise.resolve();
         const settings = getSettings();
+        if (!recoveryJournal) return needsJournalRecovery(settings, chatKey, m)
+            ? Promise.reject(new Error('Browser recovery storage is unavailable for this chat’s pending prompt edits.'))
+            : Promise.resolve();
         const state = hydratedNamespaces.get(m);
         if (state.recovery) return state.recovery;
         if (state.recoveryComplete) return Promise.resolve();
@@ -330,7 +343,11 @@
         const isCurrent = () => getSettings() === settings && overrideChatKey() === chatKey && getCtx().chatMetadata?.[NS] === m;
         state.recovery = (async () => {
             const account = await recoveryAccount(settings);
-            if (!account || !isCurrent()) return;
+            if (!isCurrent()) return;
+            if (!account) {
+                if (needsJournalRecovery(settings, chatKey, m)) throw new Error('Account identity is unavailable for this chat’s pending prompt edits.');
+                return;
+            }
             let recovered = false;
             const promptIds = new Set(settings.prompts.map(p => p.id));
             await recoveryJournal.visitChat(account, chatKey, patch => {
@@ -362,8 +379,7 @@
             console.warn('[Prompt Notebooks] Could not read the recovery journal.', error);
             // A compact revision catalogue tells us when this chat needs a disk-only
             // override. Do not generate with older text if that required read fails.
-            const revisions = settings.recoveryJournalRevisions?.[chatKey] || {};
-            if (isCurrent() && Object.entries(revisions).some(([id, revision]) => (m.overrideRevisions[id] ?? 0) < revision)) throw error;
+            if (isCurrent() && needsJournalRecovery(settings, chatKey, m)) throw error;
         }).finally(() => {
             // Returning to an existing namespace after a rapid switch must be able to
             // retry a cursor that stopped early. Only numeric baselines remain cached.
