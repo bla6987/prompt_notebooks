@@ -434,3 +434,46 @@ test('resizing or reopening clamps the floating panel without rebuilding a focus
     assert.equal(t.field('text').value, 'Keep this draft');
     t.dom.window.close();
 });
+
+test('hidden and collapsed libraries release rows; pages preserve every matching prompt', () => {
+    const prompts = Array.from({ length: 350 }, (_, i) => ({
+        id: 'large-' + i, notebookId: 'large-book', name: 'Prompt ' + i,
+        text: i === 349 ? 'needle in the last prompt' : 'body ' + i, enabledByDefault: false,
+    }));
+    const t = setup({ notebooks: [{ id: 'large-book', name: 'Large library' }], prompts,
+        panel: { open: false, x: 0, y: 0, w: 340, h: 460, search: '', tagFilter: [] } });
+    assert.equal(t.w.document.querySelectorAll('.pnb-prompt').length, 0);
+    assert.equal(t.q('[data-f="text"]'), null);
+    t.click('#pnb-launch');
+    const seen = new Set();
+    while (true) {
+        const rows = t.w.document.querySelectorAll('.pnb-prompt');
+        assert.ok(rows.length <= 100);
+        for (const row of rows) seen.add(row.dataset.id);
+        const buttons = [...t.w.document.querySelectorAll('[data-library-page]')];
+        const next = buttons.find(button => button.textContent === 'Next');
+        if (next.disabled) break;
+        next.click();
+    }
+    assert.equal(seen.size, 350);
+    const library = t.q('.pnb-library');
+    library.open = false; library.dispatchEvent(new t.w.Event('toggle'));
+    assert.equal(t.w.document.querySelectorAll('.pnb-prompt').length, 0);
+    library.open = true; library.dispatchEvent(new t.w.Event('toggle'));
+    assert.ok(t.q('.pnb-prompt'));
+    const timers = new Map(); let nextTimer = 0;
+    t.w.setTimeout = fn => { timers.set(++nextTimer, fn); return nextTimer; };
+    t.w.clearTimeout = id => timers.delete(id);
+    const search = t.q('.pnb-search');
+    for (const text of ['needle', 'needle in', 'needle in the last']) {
+        search.value = text; search.dispatchEvent(new t.w.Event('input', { bubbles: true }));
+    }
+    assert.equal(timers.size, 1, 'large-library searches coalesce');
+    const [id, run] = timers.entries().next().value; timers.delete(id); run();
+    assert.equal(t.w.document.querySelectorAll('.pnb-prompt').length, 1);
+    assert.equal(t.q('.pnb-prompt').dataset.id, 'large-349');
+    t.click('[data-act="close"]'); t.h.switchChat('chat-b');
+    assert.equal(t.w.document.querySelectorAll('.pnb-prompt').length, 0);
+    assert.equal(t.q('.pnb-editor-host').childElementCount, 0);
+    t.dom.window.close();
+});

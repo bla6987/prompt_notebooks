@@ -136,3 +136,6 @@
 .pnb-library .pnb-list { min-height: 0; }
 .pnb-editor-empty { padding: 8px; opacity: 0.65; }
 .pnb-inline-editor [hidden] { display: none !important; }
+
+.pnb-pages { display: flex; align-items: center; justify-content: space-between; gap: .5em; padding: .5em; }
+.pnb-pages span { font-size: .8em; text-align: center; }

@@ -39,6 +39,8 @@ SillyTavern. Open it from the **wand menu → Prompt Notebooks**, or run `/noteb
   Edit while using the rest of SillyTavern; text and settings **save as you type** (there is no Save/Cancel step).
   Text updates its injection immediately; text-dependent search results and override badges refresh after a short typing pause.
   Closing the panel keeps your changes, and the selected prompt reopens with the panel, including after a reload.
+  Large libraries show 100 prompt rows per page; Previous/Next reaches every match. Searches in libraries
+  larger than 100 prompts wait for a short typing pause. Hidden panels and collapsed libraries release their rows.
 - Expand **Prompt settings** for name, notebook, tags, scope, position, depth, role, frequency,
   World Info scanning, and default activation. Blank numeric fields and **Inherit** selections use the notebook defaults.
   **Use notebook scanning default** restores inherited scanning. Collapse **Prompt library** for more writing space.
@@ -76,10 +78,22 @@ Both the legacy and newer SillyTavern macro engines support this syntax.
 ## Storage
 - **Library** (notebooks + prompts) → `extension_settings.promptNotebooks` (global, reusable across all chats).
 - **Per-chat state** (active toggles, per-chat text overrides, lineage id) → `chat_metadata.promptNotebooks`.
-- Pending override edits also keep a small recovery record in extension settings, keyed by character/group
-  and exact chat id. This protects edits when a fast chat switch cancels SillyTavern's metadata debounce;
-  the record is removed after a metadata reload confirms the saved revision. SillyTavern's chat integrity
-  id also prevents recovering into a replacement chat that reuses the filename. Recovery records are not exported.
+- **Pending override recovery** → an IndexedDB journal scoped to the authenticated SillyTavern account,
+  character/group, and exact chat id. Writes coalesce typing and commit one patch at a time. Only after a
+  successful transaction is the fallback text removed from extension settings; settings keep compact
+  revision numbers instead. Opening a chat reads its journal through a cursor, without loading other
+  chats' text into RAM. Generation awaits recovery before applying notebook prompts.
+- A fresh metadata reload confirms saved revisions and removes their journal entries. Recovering an
+  edit or shallow-copying metadata does not count as confirmation. Chat integrity ids prevent recovery
+  into a replacement chat that reuses a filename. New edits win over delayed recovery, and stale reads
+  cannot update a different chat after a switch.
+- If account identity or IndexedDB is unavailable, or a write fails, unconfirmed text stays in the
+  existing settings recovery store. This safety fallback can exceed the normal residency bounds; it
+  never drops unsaved edits to meet a RAM target. A failed read of a known disk-only override stops
+  generation instead of using older text. Reload after restoring storage access to retry failed writes.
+- Recovery is local to this browser and origin. Clearing site data removes this journal; confirmed chat
+  metadata and shared prompts remain in SillyTavern's normal server storage. Recovery records are not
+  included in library exports.
 
 ## Known v0 limitations
 - **Renaming a chat** changes its id, so a "This thread" binding to that chat will dangle (use **Bind scope to this chat** to rebind it).

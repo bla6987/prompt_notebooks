@@ -40,7 +40,12 @@
     });
 
     let initialized = false;
-    const hydratedNamespaces = new WeakSet();
+    const hydratedNamespaces = new WeakMap();
+    const normalizedNotebooks = new WeakMap();
+    const accountRequests = new WeakMap();
+    const journalWriters = new WeakMap();
+    let libraryPage = 0;
+    const LIBRARY_PAGE_SIZE = 100;
     let overrideRevision = 0;
     let $panel = null;
     let editor = null;                       // selected prompt + the chat its controls belong to
@@ -71,7 +76,13 @@
         s.prompts ??= [];
         s.panel ??= { x: 80, y: 80, w: 340, h: 460, open: false, search: '', tagFilter: [] };
         if (!s.notebooks.length) s.notebooks.push({ id: uuid(), name: 'General', defaults: NOTEBOOK_DEFAULTS(), collapsed: false });
-        for (const nb of s.notebooks) { nb.defaults = Object.assign(NOTEBOOK_DEFAULTS(), nb.defaults || {}); nb.macroOnly ??= false; }
+        for (const nb of s.notebooks) {
+            if (normalizedNotebooks.get(nb) !== nb.defaults || !nb.defaults) {
+                nb.defaults = Object.assign(NOTEBOOK_DEFAULTS(), nb.defaults || {});
+                normalizedNotebooks.set(nb, nb.defaults);
+            }
+            nb.macroOnly ??= false;
+        }
         return s;
     }
     const saveSettings = () => getCtx().saveSettingsDebounced();
@@ -103,7 +114,9 @@
         // updateChatMetadata shallow-copies the outer object without loading from disk.
         // Only a fresh namespace can confirm a persisted revision.
         if (!hydratedNamespaces.has(m)) {
-            hydratedNamespaces.add(m);
+            // A recovered revision is not proof of a successful native save. Remember only
+            // revisions present in the newly loaded namespace, before applying any journal.
+            hydratedNamespaces.set(m, { baselineRevisions: { ...m.overrideRevisions }, recovery: null });
             const s = getSettings();
             const key = overrideChatKey(ctx);
             const pending = key ? s.pendingOverrides?.[key] : null;
@@ -114,8 +127,7 @@
                     if (replacedChat || !s.prompts.some(p => p.id === id) || (m.overrideRevisions[id] ?? 0) >= patch.revision) {
                         delete pending[id];
                     } else {
-                        if (patch.text) m.overrides[id] = { text: patch.text }; else delete m.overrides[id];
-                        m.overrideRevisions[id] = patch.revision;
+                        applyRecoveryPatch(m, id, patch);
                         recovered = true;
                     }
                 }
@@ -137,6 +149,227 @@
         const owner = ctx.groupId != null ? ['group', ctx.groupId]
             : ['character', ctx.characters?.[ctx.characterId]?.avatar ?? ctx.characterId];
         return JSON.stringify([...owner, chatId]);
+    }
+
+    // ───────────────────────────────────────────── durable recovery journal
+
+    // The journal never loads an archive-wide collection of text. A write owns at most one
+    // in-flight patch; a recovery cursor visits only the current account/chat, one patch at a time.
+    class RecoveryJournal {
+        constructor(factory, keyRange) { this.factory = factory; this.keyRange = keyRange; this.opening = null; }
+        open() {
+            if (this.opening) return this.opening;
+            this.opening = new Promise((resolve, reject) => {
+                let settled = false;
+                const request = this.factory.open('prompt-notebooks-recovery-v1', 1);
+                const timer = setTimeout(() => fail(new Error('Recovery storage did not open in time.')), 5000);
+                const fail = error => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } };
+                request.onupgradeneeded = () => {
+                    const store = request.result.createObjectStore('patches', { keyPath: 'key' });
+                    store.createIndex('chat', ['account', 'chatKey']);
+                    store.createIndex('prompt', ['account', 'promptId']);
+                };
+                request.onerror = () => fail(request.error || new Error('Recovery storage could not open.'));
+                request.onblocked = () => fail(new Error('Recovery storage is blocked by another tab.'));
+                request.onsuccess = () => {
+                    if (settled) { request.result.close(); return; }
+                    settled = true; clearTimeout(timer);
+                    const db = request.result;
+                    db.onversionchange = () => { db.close(); this.opening = null; };
+                    resolve(db);
+                };
+            }).catch(error => { this.opening = null; throw error; });
+            return this.opening;
+        }
+        async putLatest(account, chatKey, promptId, patch) {
+            const db = await this.open();
+            const key = JSON.stringify([account, chatKey, promptId]);
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('patches', 'readwrite');
+                const store = tx.objectStore('patches');
+                const request = store.get(key);
+                request.onsuccess = () => {
+                    // A stale settings snapshot from a previous session must not overwrite
+                    // a newer durable patch. Updates and confirmation deletes are atomic.
+                    if (!request.result || request.result.revision < patch.revision) {
+                        store.put({ key, account, chatKey, promptId, ...patch });
+                    }
+                };
+                tx.oncomplete = () => resolve();
+                tx.onabort = tx.onerror = () => reject(tx.error || new Error('Recovery write failed.'));
+            });
+        }
+        async visitChat(account, chatKey, visit) {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('patches', 'readwrite');
+                const request = tx.objectStore('patches').index('chat').openCursor(this.keyRange.only([account, chatKey]));
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return;
+                    const action = visit(cursor.value);
+                    if (action === 'delete') cursor.delete();
+                    if (action !== false) cursor.continue();
+                };
+                tx.oncomplete = () => resolve();
+                tx.onabort = tx.onerror = () => reject(tx.error || new Error('Recovery read failed.'));
+            });
+        }
+        async deletePrompt(account, promptId) {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('patches', 'readwrite');
+                const store = tx.objectStore('patches');
+                // Key-only iteration avoids materializing archived prompt text for deletion.
+                const request = store.index('prompt').openKeyCursor(this.keyRange.only([account, promptId]));
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (cursor) { store.delete(cursor.primaryKey); cursor.continue(); }
+                };
+                tx.oncomplete = () => resolve();
+                tx.onabort = tx.onerror = () => reject(tx.error || new Error('Recovery cleanup failed.'));
+            });
+        }
+    }
+
+    const recoveryJournal = globalThis.indexedDB && globalThis.IDBKeyRange
+        ? new RecoveryJournal(globalThis.indexedDB, globalThis.IDBKeyRange) : null;
+
+    function recoveryAccount(settings = getSettings()) {
+        if (!recoveryJournal || typeof globalThis.fetch !== 'function') return Promise.resolve(null);
+        if (accountRequests.has(settings)) return accountRequests.get(settings);
+        const promise = (async () => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5000);
+            try {
+                const response = await fetch('/api/users/me', {
+                    headers: getCtx().getRequestHeaders?.(), signal: controller.signal,
+                });
+                if (!response.ok) return null;
+                const user = await response.json();
+                // IndexedDB is already origin-scoped. Keep only the authenticated stable
+                // handle, never the avatar, persona name, or a newly generated settings id.
+                return typeof user?.handle === 'string' && user.handle ? user.handle : null;
+            } catch { return null; }
+            finally { clearTimeout(timer); }
+        })();
+        accountRequests.set(settings, promise);
+        return promise;
+    }
+
+    function applyRecoveryPatch(m, id, patch) {
+        if (patch.text) m.overrides[id] = { text: patch.text }; else delete m.overrides[id];
+        m.overrideRevisions[id] = patch.revision;
+        overrideRevision = Math.max(overrideRevision, patch.revision);
+    }
+
+    function nextPendingPatch(settings) {
+        for (const chatKey in settings.pendingOverrides || {}) {
+            const patches = settings.pendingOverrides[chatKey];
+            for (const promptId in patches) return { chatKey, promptId, patch: patches[promptId] };
+        }
+        return null;
+    }
+
+    function scheduleRecoveryWrite(settings = getSettings()) {
+        if (!recoveryJournal) return;
+        let state = journalWriters.get(settings);
+        if (!state) { state = { running: null, timer: null, failed: false }; journalWriters.set(settings, state); }
+        if (state.running || state.timer !== null || state.failed) return;
+        // Coalesce keystrokes in the same prompt. The queue contains no second text copy;
+        // pendingOverrides remains the durable-settings fallback until an IDB commit.
+        state.timer = setTimeout(() => {
+            state.timer = null;
+            flushRecoveryWrites(settings).catch(() => {});
+        }, 150);
+    }
+
+    async function flushRecoveryWrites(settings = getSettings()) {
+        if (!recoveryJournal) return;
+        let state = journalWriters.get(settings);
+        if (!state) { state = { running: null, timer: null, failed: false }; journalWriters.set(settings, state); }
+        clearTimeout(state.timer); state.timer = null;
+        if (state.running) return state.running;
+        if (state.failed) return;
+        state.running = (async () => {
+            const account = await recoveryAccount(settings);
+            if (!account) return;
+            let item;
+            while (getSettings() === settings && (item = nextPendingPatch(settings))) {
+                const { chatKey, promptId, patch } = item;
+                await recoveryJournal.putLatest(account, chatKey, promptId, patch);
+                // Edits made while the transaction ran replace the patch object. Retire
+                // only the exact committed revision, then write the newest one next.
+                const patches = settings.pendingOverrides?.[chatKey];
+                if (patches?.[promptId] === patch) {
+                    delete patches[promptId];
+                    if (!Object.keys(patches).length) delete settings.pendingOverrides[chatKey];
+                    settings.recoveryJournalRevisions ??= {};
+                    (settings.recoveryJournalRevisions[chatKey] ??= {})[promptId] = patch.revision;
+                    if (getSettings() === settings) saveSettings();
+                }
+                item = null;
+            }
+        })().catch(error => {
+            state.failed = true;
+            console.warn('[Prompt Notebooks] Recovery storage unavailable; keeping settings recovery records.', error);
+        }).finally(() => { state.running = null; });
+        return state.running;
+    }
+
+    function recoverCurrentJournal() {
+        const ctx = getCtx();
+        const chatKey = overrideChatKey(ctx);
+        const m = chatKey ? chatMeta() : null;
+        if (!m || !recoveryJournal) return Promise.resolve();
+        const settings = getSettings();
+        const state = hydratedNamespaces.get(m);
+        if (state.recovery) return state.recovery;
+        if (state.recoveryComplete) return Promise.resolve();
+        const integrity = ctx.chatMetadata.integrity;
+        const isCurrent = () => getSettings() === settings && overrideChatKey() === chatKey && getCtx().chatMetadata?.[NS] === m;
+        state.recovery = (async () => {
+            const account = await recoveryAccount(settings);
+            if (!account || !isCurrent()) return;
+            let recovered = false;
+            const promptIds = new Set(settings.prompts.map(p => p.id));
+            await recoveryJournal.visitChat(account, chatKey, patch => {
+                if (!isCurrent()) return false;
+                const replacedChat = patch.integrity && integrity && patch.integrity !== integrity;
+                if (replacedChat || !promptIds.has(patch.promptId)
+                    || (state.baselineRevisions[patch.promptId] ?? 0) >= patch.revision) {
+                    const known = settings.recoveryJournalRevisions?.[chatKey];
+                    if (known && (known[patch.promptId] ?? 0) <= patch.revision) {
+                        delete known[patch.promptId];
+                        if (!Object.keys(known).length) delete settings.recoveryJournalRevisions[chatKey];
+                        saveSettings();
+                    }
+                    return 'delete';
+                }
+                if ((m.overrideRevisions[patch.promptId] ?? 0) < patch.revision) {
+                    applyRecoveryPatch(m, patch.promptId, patch);
+                    recovered = true;
+                }
+                return true;
+            });
+            if (isCurrent()) state.recoveryComplete = true;
+            if (recovered && isCurrent()) {
+                getCtx().saveMetadataDebounced();
+                applyInjections(); render();
+            }
+        })().catch(error => {
+            // Storage failure never discards settings recovery or overwrites current edits.
+            console.warn('[Prompt Notebooks] Could not read the recovery journal.', error);
+            // A compact revision catalogue tells us when this chat needs a disk-only
+            // override. Do not generate with older text if that required read fails.
+            const revisions = settings.recoveryJournalRevisions?.[chatKey] || {};
+            if (isCurrent() && Object.entries(revisions).some(([id, revision]) => (m.overrideRevisions[id] ?? 0) < revision)) throw error;
+        }).finally(() => {
+            // Returning to an existing namespace after a rapid switch must be able to
+            // retry a cursor that stopped early. Only numeric baselines remain cached.
+            state.recovery = null;
+        });
+        return state.recovery;
     }
 
     function scopeContext() {
@@ -181,7 +414,8 @@
         if (n <= 1) return null;
         return () => {
             const chat = getCtx().chat || [];
-            const userCount = chat.filter(m => m && m.is_user).length;
+            let userCount = 0;
+            for (const message of chat) if (message?.is_user) userCount++;
             return userCount > 0 && (userCount % n === 0);
         };
     }
@@ -280,6 +514,13 @@
             delete patches[id];
             if (!Object.keys(patches).length) delete s.pendingOverrides[key];
         }
+        for (const [key, revisions] of Object.entries(s.recoveryJournalRevisions || {})) {
+            delete revisions[id];
+            if (!Object.keys(revisions).length) delete s.recoveryJournalRevisions[key];
+        }
+        recoveryAccount(s).then(account => account && recoveryJournal.deletePrompt(account, id)).catch(error => {
+            console.warn('[Prompt Notebooks] Deferred journal cleanup:', error);
+        });
         const sc = scopeContext(); delete sc.active[id]; delete sc.overrides[id];
         if (sc.chatId) getCtx().saveMetadataDebounced();
         saveSettings(); applyInjections();
@@ -309,6 +550,7 @@
             s.pendingOverrides ??= {};
             (s.pendingOverrides[key] ??= {})[promptId] = { text: text || '', revision, integrity: getCtx().chatMetadata.integrity ?? null };
             saveSettings();
+            scheduleRecoveryWrite(s);
         }
         getCtx().saveMetadataDebounced();
         updatePromptInjection(prompt);
@@ -506,7 +748,11 @@
         });
 
         const search = $panel.querySelector('.pnb-search');
-        search.addEventListener('input', () => { s.panel.search = search.value; saveSettings(); render(); });
+        search.addEventListener('input', () => {
+            s.panel.search = search.value; libraryPage = 0; saveSettings();
+            if (s.prompts.length > LIBRARY_PAGE_SIZE) scheduleLibraryRender(); else render();
+        });
+        $panel.querySelector('.pnb-library').addEventListener('toggle', () => render());
 
         // list interactions (delegated)
         const list = $panel.querySelector('.pnb-list');
@@ -528,6 +774,8 @@
         if (cb) toggleActive(cb.dataset.id, cb.checked);
     }
     function onListClick(e) {
+        const page = e.target.closest('[data-library-page]');
+        if (page) { libraryPage = Math.max(0, Number(page.dataset.libraryPage) || 0); render(); return; }
         const nbEdit = e.target.closest('[data-nb-edit]');
         if (nbEdit) { openNotebookEditor(getNotebook(nbEdit.dataset.nbEdit)); return; }
         const head = e.target.closest('.pnb-nb-head');
@@ -547,7 +795,7 @@
         const s = getSettings();
         const i = s.panel.tagFilter.indexOf(t);
         if (i >= 0) s.panel.tagFilter.splice(i, 1); else s.panel.tagFilter.push(t);
-        saveSettings(); render();
+        libraryPage = 0; saveSettings(); render();
     }
 
     // ───────────────────────────────────────────────── drag-to-reorder handlers
@@ -610,15 +858,20 @@
         return [...set].sort();
     }
 
-    function matchesFilter(p, s, sc) {
-        const q = (s.panel.search || '').toLowerCase().trim();
-        if (q) {
-            const hay = (p.name + ' ' + p.text + ' ' + (p.tags || []).join(' ')).toLowerCase();
-            if (!hay.includes(q)) return false;
+    function includesQueryParts(parts, query) {
+        let tail = '';
+        const keep = query.length - 1;
+        for (const part of parts) {
+            const text = String(part).toLowerCase();
+            if (text.includes(query) || (tail + text.slice(0, keep)).includes(query)) return true;
+            tail = keep ? (text.length >= keep ? text.slice(-keep) : (tail + text).slice(-keep)) : '';
         }
-        if (s.panel.tagFilter.length) {
-            if (!s.panel.tagFilter.every(t => (p.tags || []).includes(t))) return false;
-        }
+        return false;
+    }
+
+    function matchesFilter(p, s, query) {
+        if (query && !includesQueryParts([p.name, ' ', p.text, ' ', (p.tags || []).join(' ')], query)) return false;
+        if (s.panel.tagFilter.length && !s.panel.tagFilter.every(t => (p.tags || []).includes(t))) return false;
         return true;
     }
 
@@ -635,7 +888,14 @@
         libraryRenderTimer = null;
         if (!$panel) return;
         const s = getSettings();
+        if (!s.panel.open) return;
         const sc = scopeContext();
+        const list = $panel.querySelector('.pnb-list');
+        if (!$panel.querySelector('.pnb-library').open) {
+            list.replaceChildren();
+            syncEditor();
+            return;
+        }
 
         // tag filter row
         const tags = allTags();
@@ -643,19 +903,46 @@
             ? tags.map(t => `<span class="pnb-tag ${s.panel.tagFilter.includes(t) ? 'active' : ''}" data-tag="${esc(t)}">#${esc(t)}</span>`).join('')
             : '';
 
-        const list = $panel.querySelector('.pnb-list');
+        // Keep at most one page of prompt rows. Counts and filtering still inspect the
+        // complete library, and every matching prompt is reachable with page controls.
+        const query = (s.panel.search || '').toLowerCase().trim();
+        const byNotebook = new Map(s.notebooks.map(nb => [nb.id, { nb, count: 0, prompts: [] }]));
+        let expandedCount = 0;
+        const matchedIds = new Set();
+        for (const p of s.prompts) {
+            const group = byNotebook.get(p.notebookId);
+            if (!group || !matchesFilter(p, s, query)) continue;
+            group.count++;
+            matchedIds.add(p.id);
+            if (!group.nb.collapsed) expandedCount++;
+        }
+        const pages = Math.max(1, Math.ceil(expandedCount / LIBRARY_PAGE_SIZE));
+        libraryPage = Math.min(libraryPage, pages - 1);
+        let position = 0;
+        const first = libraryPage * LIBRARY_PAGE_SIZE;
+        for (const group of byNotebook.values()) {
+            group.start = position; group.seen = 0;
+            if (!group.nb.collapsed) position += group.count;
+        }
+        // A compact temporary id set avoids lowercasing each full prompt a second time.
+        for (const p of s.prompts) {
+            const group = byNotebook.get(p.notebookId);
+            if (!group || group.nb.collapsed || !matchedIds.has(p.id)) continue;
+            const index = group.start + group.seen++;
+            if (index >= first && index < first + LIBRARY_PAGE_SIZE) group.prompts.push(p);
+        }
         let html = '';
         for (const nb of s.notebooks) {
-            const prompts = s.prompts.filter(p => p.notebookId === nb.id && matchesFilter(p, s, sc));
+            const { prompts, count } = byNotebook.get(nb.id);
             html += `<div class="pnb-nb">
                 <div class="pnb-nb-head" data-id="${esc(nb.id)}">
                     <span class="pnb-caret">${nb.collapsed ? '▸' : '▾'}</span>
                     <span class="pnb-nb-name">${esc(nb.name)}${nb.macroOnly ? ' <span class="pnb-chip" title="Macro-only — delivered via the {{notebook:Name}} macro">macro</span>' : ''}</span>
-                    <span class="pnb-nb-count">${prompts.length}</span>
+                    <span class="pnb-nb-count">${count}</span>
                     <span class="pnb-btn small" data-nb-edit="${esc(nb.id)}" title="Notebook settings">⚙</span>
                 </div>`;
             if (!nb.collapsed) {
-                if (!prompts.length) html += `<div class="pnb-empty">No prompts</div>`;
+                if (!count) html += `<div class="pnb-empty">No prompts</div>`;
                 for (const p of prompts) {
                     const visible = isVisible(p, sc);
                     const on = visible && isActive(p, sc);
@@ -677,6 +964,11 @@
             }
             html += `</div>`;
         }
+        if (pages > 1) html += `<div class="pnb-pages">
+            <button type="button" data-library-page="${libraryPage - 1}" ${libraryPage === 0 ? 'disabled' : ''}>Previous</button>
+            <span>Page ${libraryPage + 1} / ${pages} · ${expandedCount} prompts</span>
+            <button type="button" data-library-page="${libraryPage + 1}" ${libraryPage + 1 === pages ? 'disabled' : ''}>Next</button>
+        </div>`;
         list.innerHTML = html;
         syncEditor();
     }
@@ -1003,6 +1295,10 @@
         else {
             clearTimeout(libraryRenderTimer);
             libraryRenderTimer = null;
+            $panel.querySelector('.pnb-list').replaceChildren();
+            $panel.querySelector('.pnb-tags').replaceChildren();
+            $panel.querySelector('.pnb-editor-host').replaceChildren();
+            editor = null;
         }
         saveSettings();
     }
@@ -1048,6 +1344,8 @@
         if (getCtx().getCurrentChatId?.()) chatMeta();   // stamp lineageId only when a chat is open
         applyInjections();
         render();
+        void recoverCurrentJournal().catch(() => {});
+        scheduleRecoveryWrite();
     }
 
     async function init() {
@@ -1068,12 +1366,19 @@
         eventSource.on(eventTypes.APP_READY, addLauncher);
 
         applyInjections();
+        void recoverCurrentJournal().catch(() => {});
+        scheduleRecoveryWrite();
         console.log('[Prompt Notebooks] initialized');
     }
 
     // Authoritative pre-generation apply (runs at script.js:4538, before AN + prompt assembly)
-    globalThis[INTERCEPTOR] = async function (/* chat, contextSize, abort, type */) {
-        try { if (initialized) applyInjections(); } catch (e) { console.error('[Prompt Notebooks] interceptor', e); }
+    globalThis[INTERCEPTOR] = async function (_chat, _contextSize, abort) {
+        try { if (initialized) { await recoverCurrentJournal(); applyInjections(); } }
+        catch (e) {
+            console.error('[Prompt Notebooks] interceptor', e);
+            toast('Could not restore this chat’s pending prompt edits from browser storage. Generation was stopped; restore storage access and try again.', 'error');
+            if (typeof abort === 'function') abort(true); else throw e;
+        }
     };
 
     if (globalThis.jQuery) jQuery(() => init()); else setTimeout(init, 500);
