@@ -196,3 +196,24 @@ test('search preserves cross-field and Unicode matches without concatenating the
         }
     } finally { r.close(); }
 });
+
+test('journal clears and integrity checks survive reload without resurrecting old text', async () => {
+    const r = rig();
+    try {
+        const p = r.settings.prompts[0];
+        r.ctx.chatMetadata.integrity = 'original';
+        r.api.setOverride(p, 'before clear');
+        const stale = structuredClone(r.ctx.chatMetadata);
+        await r.api.flushRecoveryWrites();
+        r.api.setOverride(p, '');
+        await r.api.flushRecoveryWrites();
+        r.switchChat('chat-a', stale);
+        await r.api.recoverCurrentJournal();
+        assert.equal(r.ctx.chatMetadata.promptNotebooks.overrides.p, undefined);
+        assert.equal(r.records.size, 1, 'the clear remains unconfirmed until a fresh native revision is observed');
+        r.switchChat('chat-a', { integrity: 'replacement' });
+        await r.api.recoverCurrentJournal();
+        assert.equal(r.ctx.chatMetadata.promptNotebooks.overrides.p, undefined);
+        assert.equal(r.records.size, 0, 'a replacement chat cannot inherit the old chat journal');
+    } finally { r.close(); }
+});
